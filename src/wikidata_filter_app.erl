@@ -34,21 +34,54 @@ base_capabilities() ->
                                       <<"structured">>, <<"entities">>].
 
 %%====================================================================
-%% Application behaviour
+%% Application lifecycle
 %%====================================================================
 
 start(_Type, _Args) ->
-    em_filter:start_agent(wikidata_filter, ?MODULE, #{
-        capabilities => base_capabilities()
-    }),
-    {ok, self()}.
+    case wikidata_filter_sup:start_link() of
+        {ok, Pid} ->
+            ok = start_pop_and_http(),
+            {ok, Pid};
+        Error ->
+            Error
+    end.
 
 stop(_State) ->
-    em_filter:stop_agent(wikidata_filter).
+    catch cowboy:stop_listener(wikidata_filter_query_listener),
+    catch em_pop_sup:stop_node(wikidata_filter),
+    ok.
 
 %%====================================================================
-%% Agent handler
+%% Internal
 %%====================================================================
+
+start_pop_and_http() ->
+    PopPort   = application:get_env(wikidata_filter, pop_port,   9502),
+    QueryPort = application:get_env(wikidata_filter, query_port, 9503),
+    Seeds     = application:get_env(wikidata_filter, pop_seeds,  []),
+    Vec = em_filter_vec:from_capabilities(base_capabilities()),
+    catch em_pop_sup:stop_node(wikidata_filter),
+    catch cowboy:stop_listener(wikidata_filter_query_listener),
+    {ok, PopPid} = em_pop_sup:start_node(wikidata_filter, #{
+        port            => PopPort,
+        query_port      => QueryPort,
+        vector          => Vec,
+        max_peers       => 100,
+        gossip_interval => 5_000
+    }),
+    lists:foreach(
+        fun({H, P}) -> catch em_pop_node:add_peer(PopPid, H, P) end,
+        Seeds),
+    Dispatch = cowboy_router:compile([
+        {'_', [{"/agent/query", em_filter_http,
+                #{server => wikidata_filter_server}}]}
+    ]),
+    {ok, _} = cowboy:start_clear(wikidata_filter_query_listener,
+                                  [{port, QueryPort}],
+                                  #{env => #{dispatch => Dispatch}}),
+    logger:notice("[wikidata_filter] gossip port ~w  query port ~w",
+                  [PopPort, QueryPort]),
+    ok.
 
 handle(Body, Memory) when is_binary(Body) ->
     {generate_embryo_list(Body), Memory};
